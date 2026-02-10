@@ -1,0 +1,19 @@
+server:
+  host: "0.0.0.0"
+  port: 8090
+  seed: 42
+
+models:
+  device: "cuda"
+  yolo_weights: "weights/icon_detect/model.pt"
+  caption_weights: "weights/icon_caption_florence"
+
+infer:
+  box_threshold: 0.05
+  iou_threshold: 0.7
+  batch_size: 128
+
+ocr:
+  enabled: true
+  backend: "paddleocr"
+  text_threshold: 0.9

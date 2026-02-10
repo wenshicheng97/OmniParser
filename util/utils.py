@@ -17,18 +17,52 @@ import cv2
 import numpy as np
 # %matplotlib inline
 from matplotlib import pyplot as plt
+# import easyocr
+# from paddleocr import PaddleOCR
+# reader = easyocr.Reader(['en'])
+# paddle_ocr = PaddleOCR(
+#     lang='en',  # other lang also available
+#     use_angle_cls=False,
+#     use_gpu=False,  # using cuda will conflict with pytorch in the same process
+#     show_log=False,
+#     max_batch_size=1024,
+#     use_dilation=True,  # improves accuracy
+#     det_db_score_mode='slow',  # improves accuracy
+#     rec_batch_num=1024)
+import inspect
 import easyocr
-from paddleocr import PaddleOCR
-reader = easyocr.Reader(['en'])
-paddle_ocr = PaddleOCR(
-    lang='en',  # other lang also available
-    use_angle_cls=False,
-    use_gpu=False,  # using cuda will conflict with pytorch in the same process
-    show_log=False,
-    max_batch_size=1024,
-    use_dilation=True,  # improves accuracy
-    det_db_score_mode='slow',  # improves accuracy
-    rec_batch_num=1024)
+
+reader = easyocr.Reader(["en"])
+_paddle_ocr = None
+
+def get_paddle_ocr():
+    """Create PaddleOCR lazily and only pass supported kwargs (compat 2.x/3.x)."""
+    global _paddle_ocr
+    if _paddle_ocr is not None:
+        return _paddle_ocr
+
+    import paddle
+    paddle.set_device("cpu")
+
+    from paddleocr import PaddleOCR
+
+    desired_kwargs = dict(
+        lang="en",
+        use_angle_cls=False,
+        show_log=False,
+
+        max_batch_size=1024,
+        use_dilation=True,
+        det_db_score_mode="slow",
+        rec_batch_num=1024,
+    )
+
+    sig = inspect.signature(PaddleOCR.__init__).parameters
+    filtered_kwargs = {k: v for k, v in desired_kwargs.items() if k in sig}
+
+    _paddle_ocr = PaddleOCR(**filtered_kwargs)
+    return _paddle_ocr
+
 import time
 import base64
 
@@ -304,8 +338,10 @@ def remove_overlap_new(boxes, iou_threshold, ocr_bbox=None):
                         filtered_boxes.append({'type': 'icon', 'bbox': box1_elem['bbox'], 'interactivity': True, 'content': ocr_labels, 'source':'box_yolo_content_ocr'})
                     else:
                         filtered_boxes.append({'type': 'icon', 'bbox': box1_elem['bbox'], 'interactivity': True, 'content': None, 'source':'box_yolo_content_yolo'})
+            # else:
+            #     filtered_boxes.append(box1)
             else:
-                filtered_boxes.append(box1)
+                filtered_boxes.append(box1_elem)
     return filtered_boxes # torch.tensor(filtered_boxes)
 
 
@@ -424,14 +460,27 @@ def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_T
     phrases = [str(i) for i in range(len(phrases))]
 
     # annotate the image with labels
+    # if ocr_bbox:
+    #     ocr_bbox = torch.tensor(ocr_bbox) / torch.Tensor([w, h, w, h])
+    #     ocr_bbox=ocr_bbox.tolist()
+    # else:
+    #     print('no ocr bbox!!!')
+    #     ocr_bbox = None
+
+    # ocr_bbox_elem = [{'type': 'text', 'bbox':box, 'interactivity':False, 'content':txt, 'source': 'box_ocr_content_ocr'} for box, txt in zip(ocr_bbox, ocr_text) if int_box_area(box, w, h) > 0] 
+
     if ocr_bbox:
-        ocr_bbox = torch.tensor(ocr_bbox) / torch.Tensor([w, h, w, h])
-        ocr_bbox=ocr_bbox.tolist()
+        ocr_bbox = (torch.tensor(ocr_bbox) / torch.Tensor([w, h, w, h])).tolist()
+        ocr_bbox_elem = [
+            {'type': 'text', 'bbox': box, 'interactivity': False, 'content': txt, 'source': 'box_ocr_content_ocr'}
+            for box, txt in zip(ocr_bbox, ocr_text)
+            if int_box_area(box, w, h) > 0
+        ]
     else:
         print('no ocr bbox!!!')
         ocr_bbox = None
+        ocr_bbox_elem = []
 
-    ocr_bbox_elem = [{'type': 'text', 'bbox':box, 'interactivity':False, 'content':txt, 'source': 'box_ocr_content_ocr'} for box, txt in zip(ocr_bbox, ocr_text) if int_box_area(box, w, h) > 0] 
     xyxy_elem = [{'type': 'icon', 'bbox':box, 'interactivity':True, 'content':None} for box in xyxy.tolist() if int_box_area(box, w, h) > 0]
     filtered_boxes = remove_overlap_new(boxes=xyxy_elem, iou_threshold=iou_threshold, ocr_bbox=ocr_bbox_elem)
     
@@ -501,6 +550,84 @@ def get_xywh_yolo(input):
     x, y, w, h = int(x), int(y), int(w), int(h)
     return x, y, w, h
 
+
+def _paddleocr_extract(result, text_threshold: float):
+    """
+    Normalize PaddleOCR results to (texts, boxes_xyxy).
+    Supports PaddleOCR 2.x classic list format and PaddleOCR 3.x paddlex pipeline dict format.
+    Returns:
+      texts: List[str]
+      boxes: List[[x1,y1,x2,y2]] in pixel coords (float/int)
+    """
+    texts, boxes = [], []
+
+    # Case A: PaddleOCR 2.x classic: [ [poly, (text, score)], ... ]
+    # poly: 4 points [[x,y],...]
+    if isinstance(result, list) and len(result) > 0 and isinstance(result[0], (list, tuple)):
+        # Try classic format first
+        ok_classic = False
+        try:
+            poly, rec = result[0][0], result[0][1]
+            if isinstance(rec, (list, tuple)) and len(rec) >= 2 and isinstance(rec[0], str):
+                ok_classic = True
+        except Exception:
+            ok_classic = False
+
+        if ok_classic:
+            for poly, rec in result:
+                if not (isinstance(rec, (list, tuple)) and len(rec) >= 2):
+                    continue
+                txt, score = rec[0], float(rec[1])
+                if score < text_threshold:
+                    continue
+                xs = [p[0] for p in poly]
+                ys = [p[1] for p in poly]
+                x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
+                texts.append(txt)
+                boxes.append([x1, y1, x2, y2])
+            return texts, boxes
+
+    # Case B: PaddleOCR 3.x / PaddleX pipeline: usually dict with keys like "rec_texts", "rec_scores", "dt_polys"/"dt_boxes"
+    if isinstance(result, dict):
+        rec_texts = result.get("rec_texts") or result.get("texts") or []
+        rec_scores = result.get("rec_scores") or result.get("scores") or []
+        # detection boxes: polygons or boxes
+        polys = result.get("dt_polys") or result.get("polys") or result.get("boxes") or []
+        # polys might be Nx4x2; boxes might be Nx4 (x1y1x2y2)
+
+        for i, txt in enumerate(rec_texts):
+            if i < len(rec_scores):
+                try:
+                    score = float(rec_scores[i])
+                except Exception:
+                    score = 1.0
+            else:
+                score = 1.0
+            if score < text_threshold:
+                continue
+
+            if i < len(polys):
+                b = polys[i]
+                # polygon
+                if isinstance(b, (list, tuple)) and len(b) == 4 and isinstance(b[0], (list, tuple)):
+                    xs = [p[0] for p in b]
+                    ys = [p[1] for p in b]
+                    x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
+                # xyxy box
+                elif isinstance(b, (list, tuple)) and len(b) == 4 and all(isinstance(x, (int, float)) for x in b):
+                    x1, y1, x2, y2 = b
+                else:
+                    continue
+                texts.append(str(txt))
+                boxes.append([x1, y1, x2, y2])
+
+        return texts, boxes
+
+    # Fallback: unknown format → return empty
+    return [], []
+
+
+
 def check_ocr_box(image_source: Union[str, Image.Image], display_img = True, output_bb_format='xywh', goal_filtering=None, easyocr_args=None, use_paddleocr=False):
     if isinstance(image_source, str):
         image_source = Image.open(image_source)
@@ -514,9 +641,20 @@ def check_ocr_box(image_source: Union[str, Image.Image], display_img = True, out
             text_threshold = 0.5
         else:
             text_threshold = easyocr_args['text_threshold']
-        result = paddle_ocr.ocr(image_np, cls=False)[0]
-        coord = [item[0] for item in result if item[1][1] > text_threshold]
-        text = [item[1][0] for item in result if item[1][1] > text_threshold]
+        ocr = get_paddle_ocr()
+        # result = ocr.ocr(image_np, cls=False)[0]
+        try:
+            result = ocr.ocr(image_np)[0]
+        except TypeError:
+            result = ocr.predict(image_np)[0]
+        # coord = [item[0] for item in result if item[1][1] > text_threshold]
+        # text = [item[1][0] for item in result if item[1][1] > text_threshold]
+        text, bb_xyxy = _paddleocr_extract(result, text_threshold)
+        coord = [
+            [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+            for (x1, y1, x2, y2) in bb_xyxy
+        ]
+
     else:  # EasyOCR
         if easyocr_args is None:
             easyocr_args = {}
