@@ -61,10 +61,24 @@ caption_model_processor = get_caption_model_processor(
 app = FastAPI(title="OmniParser Host API", version="0.6.0")
 
 
+def _center_ratio_to_pixels(bbox_ratio: List[float], w: int, h: int) -> tuple:
+    """Return (cx_px, cy_px) for the center of the bbox given in ratio coords."""
+    cx, cy = center_ratio_xyxy(bbox_ratio)
+    return (cx * w, cy * h)
+
+
+def _point_in_box(px: float, py: float, box: List[float]) -> bool:
+    """Return True if point (px, py) is inside box [x1, y1, x2, y2] (inclusive)."""
+    x1, y1, x2, y2 = box[0], box[1], box[2], box[3]
+    return x1 <= px <= x2 and y1 <= py <= y2
+
+
 class InferRequest(BaseModel):
     image_base64: str = Field(...)
     explore: bool = Field(False)
     ocr: Optional[bool] = Field(None)
+    clickable: Optional[List[List[int]]] = Field(default=None, description="Optional list of [x1,y1,x2,y2] pixel regions; if provided, only elements whose center lies in one of these regions are returned.")
+    restricted: Optional[List[List[int]]] = Field(default=None, description="Optional list of [x1,y1,x2,y2] pixel regions; elements whose center lies in any of these regions are excluded.")
 
 
 def center_ratio_xyxy(b: List[float]) -> List[float]:
@@ -140,8 +154,33 @@ def infer(req: InferRequest):
 
     clickable_raw = [e for e in elements if bool(e.get("interactivity"))]
 
+    w, h = img.size
+    restricted_boxes = req.restricted or []
+    clickable_boxes = req.clickable or []
+
+    def element_allowed(e: Dict[str, Any]) -> bool:
+        bbox = e.get("bbox")
+        if not (isinstance(bbox, (list, tuple)) and len(bbox) == 4):
+            return True
+        cx_px, cy_px = _center_ratio_to_pixels([float(x) for x in bbox], w, h)
+        for r in restricted_boxes:
+            if len(r) != 4:
+                continue
+            if _point_in_box(cx_px, cy_px, [float(x) for x in r]):
+                return False
+        if clickable_boxes:
+            for c in clickable_boxes:
+                if len(c) != 4:
+                    continue
+                if _point_in_box(cx_px, cy_px, [float(x) for x in c]):
+                    return True
+            return False
+        return True
+
+    clickable_filtered = [e for e in clickable_raw if element_allowed(e)]
+
     clickable: List[Dict[str, Any]] = []
-    for idx, e in enumerate(clickable_raw):
+    for idx, e in enumerate(clickable_filtered):
         ne = normalize_element(e, idx)
         if ne is not None:
             clickable.append(ne)
